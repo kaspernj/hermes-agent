@@ -164,7 +164,7 @@ class WebhookAdapter(BasePlatformAdapter):
         self._global_secret: str = config.extra.get("secret", "")
         self._static_routes: Dict[str, dict] = config.extra.get("routes", {})
         self._dynamic_routes: Dict[str, dict] = {}
-        self._dynamic_routes_fingerprint: Optional[tuple[int, int, int, int]] = None
+        self._dynamic_routes_mtime: float = 0.0
         self._routes: Dict[str, dict] = dict(self._static_routes)
         self._runner = None
         # Routes already warned about legacy V1 body-only signatures
@@ -441,16 +441,14 @@ class WebhookAdapter(BasePlatformAdapter):
         hermes_home = get_hermes_home()
         subs_path = hermes_home / _DYNAMIC_ROUTES_FILENAME
         if not subs_path.exists():
-            self._dynamic_routes_fingerprint = None
             if self._dynamic_routes:
                 self._dynamic_routes = {}
                 self._routes = dict(self._static_routes)
                 logger.debug("[webhook] Dynamic subscriptions file removed, cleared dynamic routes")
             return
         try:
-            stat = subs_path.stat()
-            fingerprint = (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns)
-            if fingerprint == self._dynamic_routes_fingerprint:
+            mtime = subs_path.stat().st_mtime
+            if mtime <= self._dynamic_routes_mtime:
                 return  # No change
             data = json.loads(subs_path.read_text(encoding="utf-8"))
             if not isinstance(data, dict):
@@ -487,7 +485,7 @@ class WebhookAdapter(BasePlatformAdapter):
                 new_dynamic[k] = v
             self._dynamic_routes = new_dynamic
             self._routes = {**self._dynamic_routes, **self._static_routes}
-            self._dynamic_routes_fingerprint = fingerprint
+            self._dynamic_routes_mtime = mtime
             logger.info(
                 "[webhook] Reloaded %d dynamic route(s): %s",
                 len(self._dynamic_routes),
