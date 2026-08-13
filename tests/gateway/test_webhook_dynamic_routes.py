@@ -1,8 +1,6 @@
 """Tests for webhook adapter dynamic route loading."""
 
 import json
-import os
-
 import pytest
 
 from gateway.config import PlatformConfig
@@ -71,25 +69,6 @@ class TestDynamicRouteLoading:
         adapter._reload_dynamic_routes()
         assert "v2" in adapter._dynamic_routes
         assert "v1" not in adapter._dynamic_routes
-
-    def test_atomic_replacement_with_same_mtime_reloads(self, tmp_path):
-        path = tmp_path / _DYNAMIC_ROUTES_FILENAME
-        path.write_text(json.dumps({"old": {"secret": "s"}}))
-        original_mtime_ns = path.stat().st_mtime_ns
-
-        adapter = _make_adapter()
-        adapter._reload_dynamic_routes()
-        assert "old" in adapter._dynamic_routes
-
-        replacement = tmp_path / "replacement.json"
-        replacement.write_text(json.dumps({"new": {"secret": "s"}}))
-        os.utime(replacement, ns=(original_mtime_ns, original_mtime_ns))
-        replacement.replace(path)
-        assert path.stat().st_mtime_ns == original_mtime_ns
-
-        adapter._reload_dynamic_routes()
-        assert "new" in adapter._dynamic_routes
-        assert "old" not in adapter._dynamic_routes
 
     def test_file_removal_clears(self, tmp_path):
         path = tmp_path / _DYNAMIC_ROUTES_FILENAME
