@@ -8,11 +8,11 @@ from test_cli_validation import valid_spec
 
 def test_collision_preserves_unrelated_route(tmp_path):
     path = tmp_path / "webhook_subscriptions.json"
-    path.write_text(json.dumps({"taken": {"description": "other"}}))
+    path.write_text(json.dumps({"taken": {"description": "other"}}), encoding="utf-8")
     store = RouteStore(path)
     with pytest.raises(RouteCollision):
         store.install("attempt", {"taken": {"description": "ours"}})
-    assert json.loads(path.read_text())["taken"]["description"] == "other"
+    assert json.loads(path.read_text(encoding="utf-8"))["taken"]["description"] == "other"
 
 
 def test_atomic_install_has_exact_agent_capable_metadata(tmp_path):

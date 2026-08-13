@@ -54,12 +54,12 @@ async def test_real_import_registration_ingress_lease_and_completion(tmp_path, m
     ctx.hooks["on_session_end"](session_id="session-1", completed=True,
                                 interrupted=False, platform="webhook")
     marker = json.loads((tmp_path / "tensorbuzz_pr_webhook_registrar" /
-                         "completion_markers" / "same-id.json").read_text())
+                         "completion_markers" / "same-id.json").read_text(encoding="utf-8"))
     assert marker["admission_verified"] is True
     assert marker["proof_outcome_verified"] is True
     assert marker["completed"] is True
     lease = json.loads((tmp_path / "tensorbuzz_pr_webhook_registrar" /
-                        "continuation_leases.json").read_text())
+                        "continuation_leases.json").read_text(encoding="utf-8"))
     assert lease[spec.ci_route_name]["state"] == "handoff_ready"
 
 
@@ -73,7 +73,7 @@ def test_registered_proof_hook_requires_byte_exact_marker(tmp_path, monkeypatch,
     ctx.hooks["post_llm_call"](session_id="session-1", platform="webhook",
                                assistant_response=response)
     marker = json.loads((tmp_path / "tensorbuzz_pr_webhook_registrar" /
-                         "proof_outcomes" / "session-1.json").read_text())
+                         "proof_outcomes" / "session-1.json").read_text(encoding="utf-8"))
     assert marker["proof_outcome_verified"] is False
 
 
@@ -83,7 +83,7 @@ def test_registered_proof_hook_accepts_only_exact_marker(tmp_path, monkeypatch):
     ctx.hooks["post_llm_call"](session_id="session-1", platform="webhook",
                                assistant_response=PROOF_EXPECTED)
     marker = json.loads((tmp_path / "tensorbuzz_pr_webhook_registrar" /
-                         "proof_outcomes" / "session-1.json").read_text())
+                         "proof_outcomes" / "session-1.json").read_text(encoding="utf-8"))
     assert marker["proof_outcome_verified"] is True
 
 

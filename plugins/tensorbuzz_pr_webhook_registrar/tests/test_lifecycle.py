@@ -77,7 +77,7 @@ def test_failed_rotation_preserves_last_good_receipt_and_cleanup_ids(tmp_path):
 
 def test_operator_registration_is_unmonitored_without_qualified_contract(tmp_path):
     credentials = tmp_path / "credentials.json"
-    credentials.write_text("{}")
+    credentials.write_text("{}", encoding="utf-8")
     credentials.chmod(0o600)
     spec = valid_spec(tmp_path).validate(require_generation=True)
     registrar = Registrar(TensorBuzzClient(HostHTTPTransport(credentials)),
@@ -118,7 +118,7 @@ def test_rotation_retirement_failure_keeps_committed_new_generation(tmp_path, mo
     assert old.ci_route_name in store.load()
     assert old.ci_provider_subscription_id not in transport.objects
     attempts = list((tmp_path / "state" / "receipts" / "attempts").glob("*.json"))
-    evidence = json.loads(attempts[-1].read_text())
+    evidence = json.loads(attempts[-1].read_text(encoding="utf-8"))
     assert evidence["cleanup_state"] == "cleanup_pending"
     assert old.ci_provider_subscription_id in evidence["retired_provider_subscription_ids"]
     assert old.ci_provider_subscription_id not in evidence["pending_provider_subscription_ids"]

@@ -67,7 +67,10 @@ def test_compensation_deletes_only_created_ids_reverse_order():
 
 def test_unqualified_host_transport_cannot_mutate(tmp_path):
     credentials = tmp_path / "credentials.json"
-    credentials.write_text('{"base_url":"https://provider.invalid","token":"not-used"}')
+    credentials.write_text(
+        '{"base_url":"https://provider.invalid","token":"not-used"}',
+        encoding="utf-8",
+    )
     credentials.chmod(0o600)
     transport = HostHTTPTransport(credentials)
     with pytest.raises(ProviderContractError, match="868fc9e5-0999-40cf-bdca-9d29981a62e1"):
@@ -76,7 +79,7 @@ def test_unqualified_host_transport_cannot_mutate(tmp_path):
 
 def test_operator_client_fails_before_create_read_or_delete(tmp_path):
     credentials = tmp_path / "credentials.json"
-    credentials.write_text("{}")
+    credentials.write_text("{}", encoding="utf-8")
     credentials.chmod(0o600)
     client = TensorBuzzClient(HostHTTPTransport(credentials))
     with pytest.raises(ProviderContractError, match="868fc9e5-0999-40cf-bdca-9d29981a62e1"):

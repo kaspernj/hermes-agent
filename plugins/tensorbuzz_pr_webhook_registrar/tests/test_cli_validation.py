@@ -12,7 +12,10 @@ from plugins.tensorbuzz_pr_webhook_registrar.tensorbuzz_pr_webhook_registrar.mod
 
 def valid_spec(tmp_path: Path, **overrides) -> RegistrationSpec:
     prompt = tmp_path / "prompt.md"
-    prompt.write_text("Continue CI ownership for this exact PR generation.")
+    prompt.write_text(
+        "Continue CI ownership for this exact PR generation.",
+        encoding="utf-8",
+    )
     values: dict[str, Any] = dict(
         repo="acme/widget", tensorbuzz_project_id=str(uuid4()), pr=7,
         head="a" * 40, build_group_id=str(uuid4()),
