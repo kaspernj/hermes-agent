@@ -1,0 +1,9 @@
+name: tensorbuzz_pr_webhook_registrar
+version: 0.1.0
+description: Host-owned TensorBuzz PR webhook registration and lifecycle operator
+author: NousResearch
+kind: standalone
+hooks:
+  - pre_gateway_dispatch
+  - post_llm_call
+  - on_session_end
