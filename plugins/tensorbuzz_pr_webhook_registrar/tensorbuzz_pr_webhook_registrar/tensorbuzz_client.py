@@ -60,6 +60,13 @@ class CreatedSubscription:
     expected: dict[str, Any]
 
 
+@dataclass(frozen=True)
+class CompensationResult:
+    deleted_ids: list[str]
+    remaining_ids: list[str]
+    provider_contract_unqualified: bool = False
+
+
 class TensorBuzzClient:
     """Provider-neutral lifecycle logic over an injected qualified adapter."""
 
@@ -117,14 +124,21 @@ class TensorBuzzClient:
         if actual.get("active", True):
             raise RuntimeError(f"provider cleanup readback failed for opaque ID {provider_id}")
 
-    def compensate(self, provider_ids: list[str]) -> None:
-        failures = []
+    def compensate(self, provider_ids: list[str]) -> CompensationResult:
+        deleted: list[str] = []
+        remaining: list[str] = []
+        contract_unqualified = False
         for provider_id in reversed(provider_ids):
             try:
                 self.delete(provider_id)
+                deleted.append(provider_id)
             except ProviderContractError:
-                raise
-            except Exception as exc:
-                failures.append(f"{provider_id}: {type(exc).__name__}")
-        if failures:
-            raise RuntimeError("provider compensation incomplete for opaque IDs: " + ", ".join(failures))
+                remaining.append(provider_id)
+                contract_unqualified = True
+            except Exception:
+                remaining.append(provider_id)
+        return CompensationResult(
+            deleted_ids=deleted,
+            remaining_ids=list(reversed(remaining)),
+            provider_contract_unqualified=contract_unqualified,
+        )

@@ -56,6 +56,25 @@ class ReceiptStore:
         path = self.path_for(spec)
         return Receipt.from_dict(json.loads(path.read_text(encoding="utf-8"))) if path.exists() else None
 
+    def load_matching_attempt(self, spec: RegistrationSpec) -> Receipt | None:
+        attempts = self.directory / "attempts"
+        if not attempts.exists():
+            return None
+        for path in sorted(attempts.glob(f"{spec.safe_repo_slug}-pr-{spec.pr}-*.json"), reverse=True):
+            receipt = Receipt.from_dict(json.loads(path.read_text(encoding="utf-8")))
+            if Registrar._receipt_matches_spec(receipt, spec, require_build_group=True):
+                return receipt
+        return None
+
+    def remove_matching_attempts(self, spec: RegistrationSpec) -> None:
+        attempts = self.directory / "attempts"
+        if not attempts.exists():
+            return
+        for path in attempts.glob(f"{spec.safe_repo_slug}-pr-{spec.pr}-*.json"):
+            receipt = Receipt.from_dict(json.loads(path.read_text(encoding="utf-8")))
+            if Registrar._receipt_matches_spec(receipt, spec, require_build_group=True):
+                path.unlink(missing_ok=True)
+
     def remove(self, spec: RegistrationSpec) -> None:
         self.path_for(spec).unlink(missing_ok=True)
 
@@ -100,6 +119,24 @@ class Registrar:
         # messages may contain transport details, so retain only their class.
         return str(exc) if isinstance(exc, ProviderContractError) else type(exc).__name__
 
+    @staticmethod
+    def _receipt_matches_spec(receipt: Receipt, spec: RegistrationSpec,
+                              *, require_build_group: bool) -> bool:
+        if (receipt.repository != spec.repo or receipt.pr != spec.pr
+                or receipt.head.lower() != spec.head.lower()):
+            return False
+        if require_build_group:
+            return receipt.build_group_id == spec.build_group_id
+        return spec.build_group_id is None or receipt.build_group_id == spec.build_group_id
+
+    @staticmethod
+    def _generation_mismatch_receipt(spec: RegistrationSpec, command: str) -> Receipt:
+        receipt = spec.new_receipt(command)
+        receipt.status = UNMONITORED
+        receipt.cleanup_state = "not_started"
+        receipt.errors = ["generation identity does not match the persisted receipt"]
+        return receipt
+
     def register(self, spec: RegistrationSpec, public_base_url: str) -> Receipt:
         spec = spec.validate(require_generation=True)
         receipt = spec.new_receipt("register")
@@ -140,8 +177,11 @@ class Registrar:
                 try: self.route_store.remove_owned(attempt_id, installed)
                 except Exception as cleanup_exc: cleanup_errors.append(type(cleanup_exc).__name__)
             if created:
-                try: self.client.compensate(created)
-                except Exception as cleanup_exc: cleanup_errors.append(type(cleanup_exc).__name__)
+                result = self.client.compensate(created)
+                receipt.retired_provider_subscription_ids = result.deleted_ids
+                receipt.pending_provider_subscription_ids = result.remaining_ids
+                if result.remaining_ids:
+                    cleanup_errors.append("ProviderCompensationIncomplete")
             receipt.status = UNMONITORED
             receipt.cleanup_state = "cleanup_pending" if cleanup_errors else "compensated"
             receipt.errors = [self._error_evidence(exc)] + cleanup_errors
@@ -198,8 +238,11 @@ class Registrar:
                 try: self.route_store.remove_owned(attempt_id, installed)
                 except Exception as cleanup_exc: cleanup_errors.append(type(cleanup_exc).__name__)
             if created:
-                try: self.client.compensate(created)
-                except Exception as cleanup_exc: cleanup_errors.append(type(cleanup_exc).__name__)
+                result = self.client.compensate(created)
+                receipt.retired_provider_subscription_ids = result.deleted_ids
+                receipt.pending_provider_subscription_ids = result.remaining_ids
+                if result.remaining_ids:
+                    cleanup_errors.append("ProviderCompensationIncomplete")
             receipt.status = UNMONITORED
             receipt.cleanup_state = "cleanup_pending" if cleanup_errors else "compensated"
             receipt.errors = [self._error_evidence(exc)] + cleanup_errors
@@ -237,20 +280,41 @@ class Registrar:
 
     def cleanup(self, spec: RegistrationSpec) -> Receipt:
         spec = spec.validate(require_generation=True)
-        receipt = self.receipts.load(spec) or spec.new_receipt("cleanup")
+        primary = self.receipts.load(spec)
+        from_attempt = False
+        if primary and self._receipt_matches_spec(primary, spec, require_build_group=True):
+            receipt = primary
+        else:
+            receipt = self.receipts.load_matching_attempt(spec)
+            from_attempt = receipt is not None
+        if receipt is None:
+            return self._generation_mismatch_receipt(spec, "cleanup")
         receipt.command = "cleanup"
-        ids = list(dict.fromkeys(
+        ids = [provider_id for provider_id in dict.fromkeys(
             [value for value in (receipt.ci_provider_subscription_id,
                                  receipt.review_provider_subscription_id) if value]
             + receipt.pending_provider_subscription_ids
-        ))
+        ) if provider_id not in receipt.retired_provider_subscription_ids]
         try:
             # Provider IDs first, then exact locally-owned routes, each with readback.
-            self.client.compensate(ids)
+            compensation = self.client.compensate(ids)
+            if compensation.remaining_ids:
+                receipt.pending_provider_subscription_ids = compensation.remaining_ids
+                receipt.retired_provider_subscription_ids = list(dict.fromkeys(
+                    receipt.retired_provider_subscription_ids + compensation.deleted_ids
+                ))
+                if compensation.provider_contract_unqualified:
+                    raise ProviderContractError(
+                        "TensorBuzz scoped delete contract is not qualified; "
+                        "provider-contract task 868fc9e5-0999-40cf-bdca-9d29981a62e1"
+                    )
+                raise RuntimeError("provider compensation incomplete")
             current = self.route_store.load()
             route_names = list(dict.fromkeys(
-                [receipt.ci_route_name, receipt.review_route_name]
-                + receipt.pending_route_names
+                receipt.pending_route_names if from_attempt else (
+                    [receipt.ci_route_name, receipt.review_route_name]
+                    + receipt.pending_route_names
+                )
             ))
             for name in route_names:
                 route = current.get(name)
@@ -259,16 +323,27 @@ class Registrar:
                     self.route_store.remove_owned(owner, [name])
                 self.leases.remove(name)
             receipt.status = "cleaned"; receipt.cleanup_state = "verified_absent"
-            self.receipts.remove(spec)
+            if from_attempt:
+                self.receipts.remove_matching_attempts(spec)
+            else:
+                self.receipts.remove(spec)
             return receipt
         except Exception as exc:
             receipt.status = UNMONITORED if isinstance(exc, ProviderContractError) else "cleanup_pending"
             receipt.cleanup_state = "cleanup_pending"
-            receipt.errors = [self._error_evidence(exc)]; self.receipts.save(spec, receipt); return receipt
+            receipt.errors = [self._error_evidence(exc)]
+            if from_attempt:
+                self.receipts.save_attempt(spec, str(uuid4()), receipt)
+            else:
+                self.receipts.save(spec, receipt)
+            return receipt
 
     def status(self, spec: RegistrationSpec) -> Receipt:
         spec = spec.validate(require_generation=False)
-        receipt = self.receipts.load(spec) or spec.new_receipt("status")
+        receipt = self.receipts.load(spec)
+        if receipt is None or not self._receipt_matches_spec(
+                receipt, spec, require_build_group=spec.build_group_id is not None):
+            return self._generation_mismatch_receipt(spec, "status")
         receipt.command = "status"
         routes = self.route_store.load()
         receipt.local_readback = all(name in routes for name in (receipt.ci_route_name, receipt.review_route_name))

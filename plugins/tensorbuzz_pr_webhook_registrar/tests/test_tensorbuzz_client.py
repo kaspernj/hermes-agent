@@ -88,3 +88,20 @@ def test_operator_client_fails_before_create_read_or_delete(tmp_path):
         client.read("opaque-id")
     with pytest.raises(ProviderContractError, match="868fc9e5-0999-40cf-bdca-9d29981a62e1"):
         client.delete("opaque-id")
+
+
+def test_compensation_reports_confirmed_deleted_and_remaining_ids():
+    class Partial(Transport):
+        def delete_callback(self, provider_id: str) -> None:
+            self.calls.append(("delete", provider_id))
+            if provider_id == "sub-1":
+                raise OSError("unavailable")
+            self.objects.pop(provider_id, None)
+    transport = Partial(); client = TensorBuzzClient(transport)
+    first = client.create_ci(str(uuid4()), 1, str(uuid4()), "https://x/1", "ref")
+    second = client.create_review(str(uuid4()), 1, "https://x/2", "ref")
+
+    result = client.compensate([first.id, second.id])
+
+    assert result.deleted_ids == [second.id]
+    assert result.remaining_ids == [first.id]

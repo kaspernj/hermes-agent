@@ -127,3 +127,110 @@ def test_rotation_retirement_failure_keeps_committed_new_generation(tmp_path, mo
     cleaned = registrar.cleanup(second)
     assert cleaned.status == "cleaned"
     assert store.load() == {}
+
+
+def test_cleanup_rejects_stale_generation_without_side_effects(tmp_path):
+    current = valid_spec(tmp_path).validate(require_generation=True)
+    transport = Transport(); store = RouteStore(tmp_path / "routes.json")
+    proof = {"ingress_accepted": True, "delivery_verified": True,
+             "replay_suppressed": True, "agent_continuation_verified": True,
+             "completion_verified": True}
+    registrar = Registrar(TensorBuzzClient(transport), store, tmp_path / "state",
+                          verifier=lambda *_a, **_k: proof)
+    registered = registrar.register(current, "https://host")
+    before_objects = dict(transport.objects)
+    before_routes = store.load()
+    stale = valid_spec(tmp_path, head="d" * 40,
+                       build_group_id=str(uuid4())).validate(require_generation=True)
+
+    rejected = registrar.cleanup(stale)
+
+    assert rejected.status == UNMONITORED
+    assert "generation" in rejected.errors[0]
+    assert transport.objects == before_objects
+    assert store.load() == before_routes
+    assert registrar.receipts.load(current) == registered
+    assert not [call for call in transport.calls if call[0] == "delete"]
+    exact = registrar.cleanup(current)
+    assert exact.status == "cleaned"
+    assert transport.objects == {} and store.load() == {}
+
+
+def test_status_rejects_stale_generation_without_provider_readback(tmp_path):
+    current = valid_spec(tmp_path).validate(require_generation=True)
+    transport = Transport(); store = RouteStore(tmp_path / "routes.json")
+    proof = {"ingress_accepted": True, "delivery_verified": True,
+             "replay_suppressed": True, "agent_continuation_verified": True,
+             "completion_verified": True}
+    registrar = Registrar(TensorBuzzClient(transport), store, tmp_path / "state",
+                          verifier=lambda *_a, **_k: proof)
+    registrar.register(current, "https://host")
+    transport.calls.clear()
+    stale = valid_spec(tmp_path, head="f" * 40,
+                       build_group_id=str(uuid4())).validate(require_generation=True)
+
+    status = registrar.status(stale)
+
+    assert status.status == UNMONITORED
+    assert "generation" in status.errors[0]
+    assert transport.calls == []
+
+
+class DeleteFailTransport(Transport):
+    def __init__(self):
+        super().__init__()
+        self.fail_deletes = True
+
+    def delete_callback(self, provider_id):
+        self.calls.append(("delete", provider_id))
+        if self.fail_deletes:
+            raise OSError("provider delete unavailable")
+        self.objects.pop(provider_id, None)
+
+
+def test_register_failed_compensation_preserves_remaining_provider_ids(tmp_path):
+    spec = valid_spec(tmp_path).validate(require_generation=True)
+    transport = DeleteFailTransport(); store = RouteStore(tmp_path / "routes.json")
+    registrar = Registrar(TensorBuzzClient(transport), store, tmp_path / "state",
+                          verifier=lambda *_a, **_k: (_ for _ in ()).throw(RuntimeError("proof failed")))
+
+    failed = registrar.register(spec, "https://host")
+
+    assert failed.status == UNMONITORED
+    assert failed.cleanup_state == "cleanup_pending"
+    assert failed.pending_provider_subscription_ids == ["sub-1", "sub-2"]
+    assert registrar.receipts.load(spec).pending_provider_subscription_ids == ["sub-1", "sub-2"]
+    transport.fail_deletes = False
+    cleaned = registrar.cleanup(spec)
+    assert cleaned.status == "cleaned"
+    assert transport.objects == {} and store.load() == {}
+
+
+def test_precommit_rotate_failed_compensation_preserves_remaining_provider_ids(tmp_path):
+    first = valid_spec(tmp_path).validate(require_generation=True)
+    transport = DeleteFailTransport(); store = RouteStore(tmp_path / "routes.json")
+    proof = {"ingress_accepted": True, "delivery_verified": True,
+             "replay_suppressed": True, "agent_continuation_verified": True,
+             "completion_verified": True}
+    registrar = Registrar(TensorBuzzClient(transport), store, tmp_path / "state",
+                          verifier=lambda *_a, **_k: proof)
+    transport.fail_deletes = False
+    old = registrar.register(first, "https://host")
+    transport.fail_deletes = True
+    registrar.verifier = lambda *_a, **_k: {**proof, "completion_verified": False}
+    second = valid_spec(tmp_path, head="e" * 40,
+                        build_group_id=str(uuid4())).validate(require_generation=True)
+
+    failed = registrar.rotate(second, "https://host")
+
+    assert failed.status == UNMONITORED
+    assert failed.cleanup_state == "cleanup_pending"
+    assert failed.pending_provider_subscription_ids == ["sub-3"]
+    preserved = registrar.receipts.load(first)
+    assert preserved.ci_provider_subscription_id == old.ci_provider_subscription_id
+    transport.fail_deletes = False
+    cleaned = registrar.cleanup(second)
+    assert cleaned.status == "cleaned"
+    assert "sub-3" not in transport.objects
+    assert old.review_provider_subscription_id in transport.objects
+    assert first.review_route_name in store.load()
