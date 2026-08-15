@@ -1057,6 +1057,58 @@ class TestIdempotency:
             assert data["status"] == "duplicate"
 
     @pytest.mark.asyncio
+    async def test_signed_registration_proof_is_accepted_then_suppressed(self):
+        secret = "proof-secret"
+        routes = {
+            "proof": {
+                "events": ["build_group.completed"],
+                "prompt": "must not run",
+                "secret": secret,
+            }
+        }
+        adapter = _make_adapter(routes=routes)
+        adapter.handle_message = AsyncMock()
+        delivery_id = "registration:disposable-proof"
+        timestamp = str(int(time.time()))
+        body = json.dumps(
+            {
+                "deliveryId": delivery_id,
+                "eventName": "build_group.completed",
+                "event_type": "build_group.completed",
+                "tensorbuzzRegistrationProof": True,
+            },
+            separators=(",", ":"),
+        ).encode()
+        headers = {
+            "Content-Type": "application/json",
+            "X-Tensorbuzz-Delivery": delivery_id,
+            "X-Tensorbuzz-Event": "build_group.completed",
+            "X-Webhook-Signature-V2": _generic_v2_signature(
+                body, secret, timestamp
+            ),
+            "X-Webhook-Timestamp": timestamp,
+        }
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            first = await cli.post("/webhooks/proof", data=body, headers=headers)
+            replay = await cli.post("/webhooks/proof", data=body, headers=headers)
+            first_receipt = await first.json()
+            replay_receipt = await replay.json()
+
+        assert first_receipt == {
+            "delivery_id": delivery_id,
+            "duplicate": False,
+            "status": "accepted",
+        }
+        assert replay_receipt == {
+            "delivery_id": delivery_id,
+            "duplicate": True,
+            "status": "accepted",
+        }
+        adapter.handle_message.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_expired_delivery_id_allows_reprocess(self):
         """After TTL expires, the same delivery ID is accepted again."""
         routes = {"idem": {"secret": _INSECURE_NO_AUTH, "prompt": "test"}}
