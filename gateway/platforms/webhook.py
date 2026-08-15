@@ -100,6 +100,7 @@ DEFAULT_HOST = None
 DEFAULT_PORT = 8644
 _INSECURE_NO_AUTH = "INSECURE_NO_AUTH"
 _DYNAMIC_ROUTES_FILENAME = "webhook_subscriptions.json"
+_DYNAMIC_ROUTE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]*$")
 _RATE_WINDOW_SECONDS = 60.0
 # Hostnames/IP literals that only serve connections originating on the same
 # machine. Anything else is treated as a public bind for safety-rail purposes.
@@ -164,7 +165,7 @@ class WebhookAdapter(BasePlatformAdapter):
         self._global_secret: str = config.extra.get("secret", "")
         self._static_routes: Dict[str, dict] = config.extra.get("routes", {})
         self._dynamic_routes: Dict[str, dict] = {}
-        self._dynamic_routes_mtime: float = 0.0
+        self._dynamic_routes_fingerprint: Optional[tuple[int, int, int, int]] = None
         self._routes: Dict[str, dict] = dict(self._static_routes)
         self._runner = None
         # Routes already warned about legacy V1 body-only signatures
@@ -436,63 +437,91 @@ class WebhookAdapter(BasePlatformAdapter):
         return web.json_response({"status": "ok", "platform": "webhook"})
 
     def _reload_dynamic_routes(self) -> None:
-        """Reload agent-created subscriptions from disk if the file changed."""
+        """Atomically replace dynamic routes with a complete valid snapshot."""
         from hermes_constants import get_hermes_home
         hermes_home = get_hermes_home()
         subs_path = hermes_home / _DYNAMIC_ROUTES_FILENAME
         if not subs_path.exists():
+            self._dynamic_routes_fingerprint = None
             if self._dynamic_routes:
                 self._dynamic_routes = {}
                 self._routes = dict(self._static_routes)
                 logger.debug("[webhook] Dynamic subscriptions file removed, cleared dynamic routes")
             return
         try:
-            mtime = subs_path.stat().st_mtime
-            if mtime <= self._dynamic_routes_mtime:
+            before = subs_path.stat()
+            fingerprint = (
+                before.st_dev,
+                before.st_ino,
+                before.st_size,
+                before.st_mtime_ns,
+            )
+            if fingerprint == self._dynamic_routes_fingerprint:
                 return  # No change
             data = json.loads(subs_path.read_text(encoding="utf-8"))
+            after = subs_path.stat()
+            if fingerprint != (
+                after.st_dev,
+                after.st_ino,
+                after.st_size,
+                after.st_mtime_ns,
+            ):
+                raise ValueError("route store changed while it was being read")
             if not isinstance(data, dict):
-                return
+                raise ValueError("route store must be a JSON object")
             # Merge: static routes take precedence over dynamic ones.
             # Reject any dynamic route whose effective secret is empty —
             # an empty secret would cause _handle_webhook to skip HMAC
             # validation entirely, letting unauthenticated callers in.
             new_dynamic: Dict[str, dict] = {}
             for k, v in data.items():
+                if not isinstance(k, str) or not _DYNAMIC_ROUTE_NAME_RE.fullmatch(k):
+                    raise ValueError(f"invalid dynamic route name: {k!r}")
+                if not isinstance(v, dict):
+                    raise ValueError(f"dynamic route '{k}' must be an object")
                 if k in self._static_routes:
                     continue
                 effective_secret = v.get("secret", self._global_secret)
-                if not effective_secret:
-                    logger.warning(
-                        "[webhook] Dynamic route '%s' skipped: 'secret' is "
-                        "missing or empty. Set a valid HMAC secret, or use "
-                        "'%s' to explicitly disable auth (testing only).",
-                        k,
-                        _INSECURE_NO_AUTH,
+                if not isinstance(effective_secret, str) or not effective_secret:
+                    raise ValueError(
+                        f"dynamic route '{k}' has no valid HMAC secret"
                     )
-                    continue
                 if (
                     effective_secret == _INSECURE_NO_AUTH
                     and not _is_loopback_host(self._host)
                 ):
-                    logger.warning(
-                        "[webhook] Dynamic route '%s' skipped: INSECURE_NO_AUTH "
-                        "is only allowed on loopback hosts. Current host: '%s'.",
-                        k,
-                        self._host,
+                    raise ValueError(
+                        f"dynamic route '{k}' uses INSECURE_NO_AUTH on "
+                        f"non-loopback host {self._host!r}"
                     )
-                    continue
+                events = v.get("events", [])
+                if not isinstance(events, list) or not all(
+                    isinstance(event, str) and event for event in events
+                ):
+                    raise ValueError(
+                        f"dynamic route '{k}' events must be non-empty strings"
+                    )
+                if "deliver_extra" in v and not isinstance(v["deliver_extra"], dict):
+                    raise ValueError(
+                        f"dynamic route '{k}' deliver_extra must be an object"
+                    )
+                if "prompt" in v and not isinstance(v["prompt"], str):
+                    raise ValueError(f"dynamic route '{k}' prompt must be a string")
                 new_dynamic[k] = v
             self._dynamic_routes = new_dynamic
             self._routes = {**self._dynamic_routes, **self._static_routes}
-            self._dynamic_routes_mtime = mtime
+            self._dynamic_routes_fingerprint = fingerprint
             logger.info(
                 "[webhook] Reloaded %d dynamic route(s): %s",
                 len(self._dynamic_routes),
                 ", ".join(self._dynamic_routes.keys()) or "(none)",
             )
         except Exception as e:
-            logger.error("[webhook] Failed to reload dynamic routes: %s", e)
+            logger.error(
+                "[webhook] Rejected dynamic route snapshot; preserving the "
+                "last known valid snapshot: %s",
+                e,
+            )
 
     def _resolve_request_profile(self, request: "web.Request"):
         """Resolve + validate the /p/<profile>/ URL prefix on a webhook request.
@@ -645,6 +674,41 @@ class WebhookAdapter(BasePlatformAdapter):
                 {"status": "ignored", "event": event_type}
             )
 
+        delivery_id = request.headers.get(
+            "X-Tensorbuzz-Delivery",
+            request.headers.get(
+                "X-GitHub-Delivery",
+                request.headers.get(
+                    "svix-id",
+                    request.headers.get(
+                        "X-Request-ID", str(int(time.time() * 1000))
+                    ),
+                ),
+            ),
+        )
+
+        # Registration proofs deliberately stop here after route, HMAC, body,
+        # and event scope validation:
+        # they prove live ingress without running scripts, delivery adapters,
+        # or an agent turn.
+        if payload.get("tensorbuzzRegistrationProof") is True:
+            if (
+                payload.get("deliveryId") != delivery_id
+                or payload.get("eventName") != event_type
+            ):
+                return web.json_response(
+                    {"error": "Invalid registration proof"}, status=400
+                )
+            duplicate = not self._record_delivery_id(delivery_id, time.time())
+            return web.json_response(
+                {
+                    "delivery_id": delivery_id,
+                    "duplicate": duplicate,
+                    "status": "accepted",
+                },
+                status=200,
+            )
+
         if not self._route_processor.route_filters_match(
             route_config, payload, event_type, request.headers
         ):
@@ -719,22 +783,11 @@ class WebhookAdapter(BasePlatformAdapter):
             except Exception as e:
                 logger.warning("[webhook] Skill loading failed: %s", e)
 
-        # Build a unique delivery ID
-        delivery_id = request.headers.get(
-            "X-GitHub-Delivery",
-            request.headers.get(
-                "svix-id",
-                request.headers.get("X-Request-ID", str(int(time.time() * 1000))),
-            ),
-        )
-
-        # ── Idempotency ─────────────────────────────────────────
-        # Skip duplicate deliveries (webhook retries).
+        # Normal deliveries are claimed only after filters and scripts accept
+        # them, preserving retry behavior for ignored events.
         now = time.time()
         if not self._record_delivery_id(delivery_id, now):
-            logger.info(
-                "[webhook] Skipping duplicate delivery %s", delivery_id
-            )
+            logger.info("[webhook] Skipping duplicate delivery %s", delivery_id)
             return web.json_response(
                 {"status": "duplicate", "delivery_id": delivery_id},
                 status=200,

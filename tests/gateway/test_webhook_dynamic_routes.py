@@ -1,6 +1,7 @@
 """Tests for webhook adapter dynamic route loading."""
 
 import json
+import os
 import pytest
 
 from gateway.config import PlatformConfig
@@ -70,6 +71,21 @@ class TestDynamicRouteLoading:
         assert "v2" in adapter._dynamic_routes
         assert "v1" not in adapter._dynamic_routes
 
+    def test_atomic_replacement_with_same_mtime_reloads(self, tmp_path):
+        path = tmp_path / _DYNAMIC_ROUTES_FILENAME
+        path.write_text(json.dumps({"old": {"secret": "s"}}))
+        original_mtime_ns = path.stat().st_mtime_ns
+        adapter = _make_adapter()
+        adapter._reload_dynamic_routes()
+
+        replacement = tmp_path / "replacement.json"
+        replacement.write_text(json.dumps({"new": {"secret": "s"}}))
+        os.utime(replacement, ns=(original_mtime_ns, original_mtime_ns))
+        replacement.replace(path)
+
+        adapter._reload_dynamic_routes()
+        assert set(adapter._dynamic_routes) == {"new"}
+
     def test_file_removal_clears(self, tmp_path):
         path = tmp_path / _DYNAMIC_ROUTES_FILENAME
         path.write_text(json.dumps({"temp": {"secret": "s"}}))
@@ -87,6 +103,19 @@ class TestDynamicRouteLoading:
         adapter._reload_dynamic_routes()
         assert "static" in adapter._routes
         assert len(adapter._dynamic_routes) == 0
+
+    def test_corrupted_replacement_preserves_last_valid_snapshot(self, tmp_path):
+        path = tmp_path / _DYNAMIC_ROUTES_FILENAME
+        path.write_text(json.dumps({"valid": {"secret": "s"}}))
+        adapter = _make_adapter()
+        adapter._reload_dynamic_routes()
+
+        replacement = tmp_path / "replacement.json"
+        replacement.write_text("not json")
+        replacement.replace(path)
+        adapter._reload_dynamic_routes()
+
+        assert set(adapter._dynamic_routes) == {"valid"}
 
 
 class TestDynamicRouteSecretValidation:
@@ -150,7 +179,7 @@ class TestDynamicRouteSecretValidation:
         assert "pub" not in adapter._routes
         assert "pub" not in adapter._dynamic_routes
 
-    def test_warning_logged_on_skip(self, tmp_path, caplog):
+    def test_warning_logged_on_rejected_snapshot(self, tmp_path, caplog):
         import logging
         (tmp_path / _DYNAMIC_ROUTES_FILENAME).write_text(
             json.dumps({"silent": {"secret": "", "prompt": "x"}})
@@ -158,10 +187,10 @@ class TestDynamicRouteSecretValidation:
         adapter = _make_adapter()
         with caplog.at_level(logging.WARNING, logger="gateway.platforms.webhook"):
             adapter._reload_dynamic_routes()
-        assert any("silent" in rec.message for rec in caplog.records)
+        assert any("preserving the last known valid snapshot" in rec.message for rec in caplog.records)
 
-    def test_partial_skip(self, tmp_path):
-        # One route bad, one route good — only the bad one is dropped.
+    def test_one_invalid_route_rejects_the_complete_snapshot(self, tmp_path):
+        # Never publish a partially validated route-store replacement.
         (tmp_path / _DYNAMIC_ROUTES_FILENAME).write_text(
             json.dumps({
                 "bad":  {"secret": "", "prompt": "x"},
@@ -170,5 +199,5 @@ class TestDynamicRouteSecretValidation:
         )
         adapter = _make_adapter()
         adapter._reload_dynamic_routes()
-        assert "good" in adapter._routes
+        assert "good" not in adapter._routes
         assert "bad" not in adapter._routes
